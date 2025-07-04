@@ -1,32 +1,37 @@
 import os
 import time
 from datetime import datetime
-from typing import List, Dict, Any, Optional
 import streamlit as st
-from langgraph import graph
-from langchain_core.messages import HumanMessage, AIMessage
-from langchain_community.chat_models import ChatGroq
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_community.document_loaders import WebBaseLoader
-from browser_env import AutoBrowser, BrowserEnv
-from browser_env.actions import Action, ActionParsingError
-from browser_env.actions import ActionTypes
+from langchain_groq import ChatGroq
 import redis
 from pydantic import BaseModel
+from typing import List, Dict, Any, TypedDict
+from browser_use import Browser
+import asyncio
+
+# Define State
+class AgentState(TypedDict):
+    emails: List[Dict[str, Any]]
+    summaries: List[Dict[str, Any]]
+    current_email: Dict[str, Any]
+    reply_content: str
 
 # Configuration
-REDIS_HOST = "localhost"
-REDIS_PORT = 6379
-GROQ_MODEL = "mixtral-8x7b-32768"
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-CHROME_PROFILE_PATH = "C:/Users/shiva/AppData/Local/Google/Chrome/User Data/Profile 6"  # Update this path
-GMAIL_URL = "https://mail.google.com"
+class Config:
+    def __init__(self):
+        self.REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+        self.REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+        self.GROQ_MODEL = os.getenv("GROQ_MODEL", "mixtral-8x7b-32768")
+        self.GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+        self.CHROME_PROFILE_PATH = os.getenv("CHROME_PROFILE_PATH", "/path/to/chrome/profile")
+        self.GMAIL_URL = "https://mail.google.com"
+        self.CACHE_TTL = int(os.getenv("CACHE_TTL", 3600))
 
-# Redis client for caching
-redis_client = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, db=0)
-
-# Pydantic models for data validation
+# Data Models
 class EmailSummary(BaseModel):
     sender: str
     subject: str
@@ -34,257 +39,196 @@ class EmailSummary(BaseModel):
     summary: str
     original_content: str
 
-class EmailReply(BaseModel):
-    email_id: str
-    reply_content: str
-
-# Initialize Groq LLM
-llm = ChatGroq(temperature=0.7, model_name=GROQ_MODEL, groq_api_key=GROQ_API_KEY)
-
-# Prompts
-SUMMARY_PROMPT = ChatPromptTemplate.from_template(
-    """You are an expert email assistant. Summarize the following email in 3-4 bullet points.
-    
-    From: {sender}
-    Subject: {subject}
-    Received: {received_time}
-    
-    Email Content:
-    {content}
-    
-    Summary:
-    -"""
-)
-
-REPLY_PROMPT = ChatPromptTemplate.from_template(
-    """You are helping compose a professional email reply. The original email was:
-    
-    From: {sender}
-    Subject: {subject}
-    Received: {received_time}
-    
-    Original Content:
-    {content}
-    
-    The user has provided these instructions for the reply:
-    {reply_instructions}
-    
-    Please compose a professional email response that addresses all points from the original email and incorporates the user's instructions.
-    
-    Reply:
-    """
-)
-
-# Chains
-summary_chain = SUMMARY_PROMPT | llm | StrOutputParser()
-reply_chain = REPLY_PROMPT | llm | StrOutputParser()
-
 class EmailAgent:
     def __init__(self):
-        self.browser = AutoBrowser(
-            headless=False,
-            chrome_profile_path=CHROME_PROFILE_PATH
+        self.config = Config()
+        self.redis = redis.StrictRedis(
+            host=self.config.REDIS_HOST,
+            port=self.config.REDIS_PORT,
+            db=0
         )
-        self.env = BrowserEnv()
-        self.current_email_id = None
-        self.summaries: List[EmailSummary] = []
+        self.browser = Browser(
+            profile_path=self.config.CHROME_PROFILE_PATH,
+            headless=False
+        )
+        self.llm = ChatGroq(
+            temperature=0.7,
+            model_name=self.config.GROQ_MODEL,
+            groq_api_key=self.config.GROQ_API_KEY
+        )
         
-    def navigate_to_gmail(self) -> None:
-        """Navigate to Gmail and wait for it to load"""
-        self.browser.goto(GMAIL_URL)
-        time.sleep(5)  # Wait for page to load
+        # Initialize workflow
+        self.workflow = StateGraph(AgentState)
+        self._build_workflow()
+    
+    def _build_workflow(self):
+        # Define nodes
+        self.workflow.add_node("navigate_gmail", self.navigate_to_gmail)
+        self.workflow.add_node("fetch_emails", self.fetch_emails)
+        self.workflow.add_node("process_email", self.process_email)
+        self.workflow.add_node("summarize_email", self.summarize_email)
+        self.workflow.add_node("generate_reply", self.generate_reply)
         
-    def get_unread_emails(self) -> List[Dict[str, Any]]:
-        """Get all unread emails from the inbox"""
-        self.browser.goto(GMAIL_URL)
-        time.sleep(5)
+        # Define edges
+        self.workflow.add_edge("navigate_gmail", "fetch_emails")
+        self.workflow.add_edge("fetch_emails", "process_email")
+        self.workflow.add_edge("process_email", "summarize_email")
+        self.workflow.add_edge("summarize_email", END)
+        
+        # Conditional edge for reply generation
+        self.workflow.add_conditional_edges(
+            "summarize_email",
+            self.should_generate_reply,
+            {"generate_reply": "generate_reply", END: END}
+        )
+        self.workflow.add_edge("generate_reply", END)
+        
+        self.workflow.set_entry_point("navigate_gmail")
+        self.app = self.workflow.compile()
+    
+    async def navigate_to_gmail(self, state: AgentState) -> AgentState:
+        """Navigate to Gmail"""
+        await self.browser.start()
+        page = await self.browser.get_current_page()
+        await page.goto(self.config.GMAIL_URL)
+        await page.wait_for_selector("div[role='main']", timeout=20000)
+        return add_messages(state, {"status": "navigated_to_gmail"})
+    
+    async def fetch_emails(self, state: AgentState) -> AgentState:
+        """Fetch unread emails"""
+        page = await self.browser.get_current_page()
+        elements = await page.query_selector_all("tr.zA")  # Adjust selector as needed
         emails = []
-        email_elements = self.browser.find_elements('css selector', 'tr.zA')  # Gmail email rows
-        for elem in email_elements:
-            is_unread = 'zE' in elem.get_attribute('class')  # 'zE' is Gmail's unread class
+        for el in elements:
+            class_attr = await el.get_attribute('class')
+            is_unread = 'zE' in class_attr if class_attr else False
             if not is_unread:
-                break  # Stop at first read email
-            sender = elem.find_element('css selector', '.yX.xY .yW span').text
-            subject = elem.find_element('css selector', '.y6 span').text
-            received_time = elem.find_element('css selector', '.xW.xY span').get_attribute('title')
-            email_id = elem.get_attribute('data-legacy-message-id')
+                break
+            sender_elem = await el.query_selector('.yX.xY .yW span')
+            subject_elem = await el.query_selector('.y6 span')
+            received_time_elem = await el.query_selector('.xW.xY span')
+            sender = await sender_elem.inner_text() if sender_elem else ''
+            subject = await subject_elem.inner_text() if subject_elem else ''
+            received_time = await received_time_elem.get_attribute('title') if received_time_elem else ''
+            email_id = await el.get_attribute('data-legacy-message-id')
             emails.append({
                 "id": email_id,
                 "sender": sender,
                 "subject": subject,
                 "received_time": received_time,
             })
-        return emails
+        return add_messages(state, {"emails": emails})
     
-    def open_email(self, email_id: str) -> str:
-        """Open a specific email and return its content"""
-        self.current_email_id = email_id
-        email_elem = self.browser.find_element('css selector', f'tr[data-legacy-message-id="{email_id}"]')
-        email_elem.click()
-        time.sleep(2)
-        content_elem = self.browser.find_element('css selector', 'div.a3s.aXjCH')  # Gmail email body
-        return content_elem.text
-    
-    def summarize_email(self, email_data: Dict[str, Any]) -> EmailSummary:
-        """Generate a summary of an email"""
-        # Check cache first
-        cache_key = f"email_summary:{email_data['id']}"
-        cached_summary = redis_client.get(cache_key)
+    async def process_email(self, state: AgentState) -> AgentState:
+        """Process current email"""
+        if not state["emails"]:
+            return add_messages(state, {"status": "no_emails"})
         
-        if cached_summary:
-            return EmailSummary.parse_raw(cached_summary)
+        page = await self.browser.get_current_page()
+        email = state["emails"][0]
+        email_elem = await page.query_selector(f"tr[data-legacy-message-id='{email['id']}']")
+        if email_elem:
+            await email_elem.click()
+            await page.wait_for_selector('div.a3s.aXjCH')
+            content_elem = await page.query_selector('div.a3s.aXjCH')
+            email["content"] = await content_elem.inner_text() if content_elem else ""
+        
+        return add_messages(state, {
+            "current_email": email,
+            "remaining_emails": state["emails"][1:]
+        })
+    
+    def summarize_email(self, state: AgentState) -> AgentState:
+        """Generate email summary"""
+        prompt = ChatPromptTemplate.from_template("""
+            Summarize this email in bullet points:
             
-        # Generate summary
-        summary = summary_chain.invoke({
-            "sender": email_data["sender"],
-            "subject": email_data["subject"],
-            "received_time": email_data["received_time"],
-            "content": email_data["content"]
+            From: {sender}
+            Subject: {subject}
+            Received: {time}
+            
+            Content:
+            {content}
+            
+            Summary:""")
+        
+        chain = prompt | self.llm | StrOutputParser()
+        
+        summary = chain.invoke({
+            "sender": state["current_email"]["sender"],
+            "subject": state["current_email"]["subject"],
+            "time": state["current_email"]["received_time"],
+            "content": state["current_email"]["content"]
         })
         
-        # Create summary object
-        email_summary = EmailSummary(
-            sender=email_data["sender"],
-            subject=email_data["subject"],
-            received_time=email_data["received_time"],
-            summary=summary,
-            original_content=email_data["content"]
-        )
-        
-        # Cache the summary
-        redis_client.set(cache_key, email_summary.json(), ex=3600)  # Cache for 1 hour
-        
-        return email_summary
+        return add_messages(state, {
+            "summary": summary,
+            "summaries": state.get("summaries", []) + [{
+                "sender": state["current_email"]["sender"],
+                "subject": state["current_email"]["subject"],
+                "received_time": state["current_email"]["received_time"],
+                "summary": summary,
+                "content": state["current_email"]["content"]
+            }]
+        })
     
-    def process_unread_emails(self) -> None:
-        """Process all unread emails and generate summaries"""
-        self.navigate_to_gmail()
-        unread_emails = self.get_unread_emails()
-        
-        for email in unread_emails:
-            content = self.open_email(email["id"])
-            email["content"] = content
-            summary = self.summarize_email(email)
-            self.summaries.append(summary)
+    def should_generate_reply(self, state: AgentState) -> str:
+        """Determine if we should generate a reply"""
+        return "generate_reply" if state.get("needs_reply") else END
+    
+    def generate_reply(self, state: AgentState) -> AgentState:
+        """Generate email reply"""
+        prompt = ChatPromptTemplate.from_template("""
+            Write a professional reply to this email:
             
-            # Mark as read (would use browser automation in real implementation)
-            self.mark_email_as_read(email["id"])
-    
-    def mark_email_as_read(self, email_id: str) -> None:
-        """Mark an email as read"""
-        # Implement with browser automation
-        pass
-    
-    def compose_reply(self, email_id: str, reply_instructions: str) -> str:
-        """Compose a reply to an email"""
-        # Find the original email
-        original_summary = next(
-            (s for s in self.summaries if s.sender == email_id.split('_')[0]), None
-        )
-        
-        if not original_summary:
-            return "Original email not found"
+            Original:
+            From: {sender}
+            Subject: {subject}
+            Received: {time}
             
-        # Generate reply
-        reply = reply_chain.invoke({
-            "sender": original_summary.sender,
-            "subject": original_summary.subject,
-            "received_time": original_summary.received_time,
-            "content": original_summary.original_content,
-            "reply_instructions": reply_instructions
+            Content:
+            {content}
+            
+            Reply:""")
+        
+        chain = prompt | self.llm | StrOutputParser()
+        
+        reply = chain.invoke({
+            "sender": state["current_email"]["sender"],
+            "subject": state["current_email"]["subject"],
+            "time": state["current_email"]["received_time"],
+            "content": state["current_email"]["content"]
         })
         
-        return reply
+        return add_messages(state, {"reply_content": reply})
     
-    def send_reply(self, email_id: str, reply_content: str) -> bool:
-        """Send a reply through Gmail"""
-        # Implement with browser automation:
-        # 1. Open the email
-        # 2. Click reply
-        # 3. Fill in the content
-        # 4. Click send
-        
-        # For prototype, just return success
-        return True
-
-# LangGraph workflow
-def create_email_workflow(agent: EmailAgent):
-    workflow = graph.Graph()
-    
-    # Define nodes
-    workflow.add_node("navigate_to_gmail", agent.navigate_to_gmail)
-    workflow.add_node("get_unread_emails", agent.get_unread_emails)
-    workflow.add_node("process_email", lambda emails: [agent.process_single_email(e) for e in emails])
-    workflow.add_node("summarize_emails", lambda: agent.summaries)
-    
-    # Define edges
-    workflow.add_edge("navigate_to_gmail", "get_unread_emails")
-    workflow.add_edge("get_unread_emails", "process_email")
-    workflow.add_edge("process_email", "summarize_emails")
-    
-    # Set entry point
-    workflow.set_entry_point("navigate_to_gmail")
-    
-    return workflow.compile()
+    async def run(self):
+        """Execute the workflow"""
+        return await self.app.invoke({"emails": [], "summaries": []})
 
 # Streamlit UI
-def display_streamlit_ui(agent: EmailAgent):
-    st.title("Email Summarizer and Replier Agent")
+def main():
+    st.set_page_config(page_title="Email Agent", layout="wide")
+    st.title("📧 Email Agent with StateGraph")
     
-    if not agent.summaries:
-        st.warning("No unread emails found or processed yet.")
-        if st.button("Process Unread Emails"):
-            with st.spinner("Processing unread emails..."):
-                agent.process_unread_emails()
-            st.experimental_rerun()
-        return
+    if "agent" not in st.session_state:
+        st.session_state.agent = EmailAgent()
     
-    st.success(f"Found {len(agent.summaries)} unread emails")
-    
-    for i, summary in enumerate(agent.summaries):
-        st.subheader(f"From: {summary.sender} - {summary.received_time}")
-        st.markdown(f"**Subject:** {summary.subject}")
-        st.markdown("**Summary:**")
-        st.markdown(summary.summary)
+    if st.button("Run Email Processing"):
+        result = asyncio.run(st.session_state.agent.run())
+        st.session_state.result = result
         
-        # Reply section
-        with st.expander("Reply to this email"):
-            reply_text = st.text_area(
-                "Enter your reply instructions:",
-                key=f"reply_{i}",
-                height=150
-            )
-            
-            if st.button("Generate Reply", key=f"gen_reply_{i}"):
-                with st.spinner("Generating reply..."):
-                    reply_content = agent.compose_reply(
-                        f"{summary.sender}_{i}",  # Simulated email ID
-                        reply_text
-                    )
-                    st.session_state[f"generated_reply_{i}"] = reply_content
+    if "result" in st.session_state:
+        st.subheader("Processing Results")
+        for summary in st.session_state.result["summaries"]:
+            with st.expander(f"{summary['sender']}: {summary['subject']}"):
+                st.markdown(f"**Received:** {summary['received_time']}")
+                st.markdown("**Summary:**")
+                st.markdown(summary['summary'])
                 
-            if f"generated_reply_{i}" in st.session_state:
-                st.markdown("**Generated Reply:**")
-                st.markdown(st.session_state[f"generated_reply_{i}"])
-                
-                if st.button("Send Reply", key=f"send_reply_{i}"):
-                    success = agent.send_reply(
-                        f"{summary.sender}_{i}",  # Simulated email ID
-                        st.session_state[f"generated_reply_{i}"]
-                    )
-                    if success:
-                        st.success("Reply sent successfully!")
-                    else:
-                        st.error("Failed to send reply")
+                if 'reply_content' in st.session_state.result:
+                    st.markdown("**Generated Reply:**")
+                    st.markdown(st.session_state.result['reply_content'])
 
-# Main execution
 if __name__ == "__main__":
-    # Initialize the agent
-    email_agent = EmailAgent()
-    
-    # Create and run the workflow
-    workflow = create_email_workflow(email_agent)
-    workflow.invoke({})
-    
-    # Display the Streamlit UI
-    display_streamlit_ui(email_agent)
+    main()
