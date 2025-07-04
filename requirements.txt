@@ -1,0 +1,10 @@
+langgraph
+langchain
+langchain-community
+groq
+redis
+streamlit
+pydantic
+python-dotenv
+browser-use
+beautifulsoup4
