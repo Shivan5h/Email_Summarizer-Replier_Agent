@@ -48,7 +48,7 @@ An automatic **agentic AI system** that reads your Gmail inbox, summarizes unrea
 ## 📂 Project Structure
 
 ```
-email-agent/
+Email_Summarizer-Replier_Agent/
 │
 ├── app.py                 # Main Streamlit application
 ├── .env                  # Secrets (Groq key, etc.) - DO NOT COMMIT
